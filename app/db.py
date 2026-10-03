@@ -68,6 +68,35 @@ CREATE INDEX IF NOT EXISTS idx_batch_line_seq ON batch(line_id, seq);
 -- idx_batch_status 引用作废功能新增的 status 列；为避免旧库在建表阶段
 -- 引用尚未迁移的列，该索引在 initialize() 完成列迁移后通过 _migrate_indexes 幂等创建。
 
+-- 批次号更正（标识更正）：现场发现已投产批次号录错时，凭现行批次号、未占用的新号与
+-- 非空原因把现行号更正为新号；同一批可连续更正。编号更正只改“标识”，不改批次内容、
+-- 产线/顺序号、裁决/出货资格版本、核验单修订号与状态，也不释放发运占用。
+-- 记录只追加、不可变。
+CREATE TABLE IF NOT EXISTS batch_no_rename (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    previous_batch_no TEXT NOT NULL,           -- 更正前的现行批次号
+    new_batch_no    TEXT NOT NULL,             -- 更正后的现行批次号
+    reason          TEXT NOT NULL,             -- 非空更正原因
+    renamed_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_batch_rename_prev ON batch_no_rename(previous_batch_no);
+CREATE INDEX IF NOT EXISTS idx_batch_rename_new ON batch_no_rename(new_batch_no);
+
+-- 批次号别名（查询别名）：每次更正后，原现行号永久保留为历史别名、不得再登记；
+-- 当前现行号本身也登记为指向自身的别名，以便登记新批次时统一查重、
+-- 以及所有按号查询/处理入口统一把历史号解析到同一批的现行号。
+-- 全部表对批次的“当前关联”（batch、adjudication、shipment_eligibility、
+-- verification_batch、占用等）均以现行号为键；历史快照表保留记录时的批次号。
+CREATE TABLE IF NOT EXISTS batch_no_alias (
+    alias_batch_no  TEXT PRIMARY KEY,           -- 历史号或现行号本身
+    current_batch_no TEXT NOT NULL REFERENCES batch(batch_no),
+    is_current      INTEGER NOT NULL,           -- 1=当前现行号 / 0=历史别名
+    created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_batch_alias_current ON batch_no_alias(current_batch_no);
+
 CREATE TABLE IF NOT EXISTS batch_material (
     batch_no  TEXT NOT NULL REFERENCES batch(batch_no),
     lot_no    TEXT NOT NULL REFERENCES material_lot(lot_no),
@@ -201,6 +230,7 @@ CREATE TABLE IF NOT EXISTS verification_confirmation_batch (
     verification_no      TEXT NOT NULL REFERENCES verification(verification_no),
     position             INTEGER NOT NULL,
     batch_no             TEXT NOT NULL,
+    recorded_batch_no    TEXT,                  -- 确认记录时的批次号（编号更正不改写；旧库回填为当时号）
     snapshot_version     INTEGER NOT NULL,
     snapshot_disposition TEXT NOT NULL,
     snapshot_actual      TEXT NOT NULL DEFAULT '[]',
@@ -237,7 +267,8 @@ CREATE INDEX IF NOT EXISTS idx_handover_verification
 CREATE TABLE IF NOT EXISTS shipment_handover_batch (
     handover_no           TEXT NOT NULL REFERENCES shipment_handover(handover_no),
     position              INTEGER NOT NULL,      -- 按确认清单顺序保序
-    batch_no              TEXT NOT NULL REFERENCES batch(batch_no),
+    batch_no              TEXT NOT NULL,         -- 现行批次号（随编号更正更新）
+    recorded_batch_no     TEXT,                  -- 交接记录时的批次号（冻结，不改写；旧库回填）
     confirmation_id       INTEGER NOT NULL REFERENCES verification_confirmation(id),
     snapshot_version      INTEGER NOT NULL,
     snapshot_disposition  TEXT NOT NULL,         -- RELEASE / HOLD
@@ -274,8 +305,9 @@ CREATE INDEX IF NOT EXISTS idx_hoccupancy_handover
 CREATE TABLE IF NOT EXISTS shipment_review (
     id                       INTEGER PRIMARY KEY AUTOINCREMENT,
     handover_no              TEXT NOT NULL REFERENCES shipment_handover(handover_no),
-    batch_no                 TEXT NOT NULL REFERENCES batch(batch_no),
-    position                 INTEGER NOT NULL,      -- 冗余交接清单顺序，便于按序展示
+    batch_no                 TEXT NOT NULL,      -- 现行批次号（随编号更正更新）
+    recorded_batch_no        TEXT,               -- 处置记录时的批次号（只追加记录的历史号，不改写；旧库回填）
+    position                 INTEGER NOT NULL,   -- 冗余交接清单顺序，便于按序展示
     -- 处置时质检员“所见状态”（乐观并发）：三类当前信息须与处置时的实际当前状态一致
     seen_adjudication_version INTEGER NOT NULL,     -- 所见当前裁决版本
     seen_shipment_version     INTEGER NOT NULL,     -- 所见当前出货资格版本
@@ -315,7 +347,8 @@ CREATE TABLE IF NOT EXISTS shipment_return_batch (
     return_no        TEXT NOT NULL REFERENCES shipment_return(return_no),
     handover_no      TEXT NOT NULL REFERENCES shipment_handover(handover_no),
     position         INTEGER NOT NULL,          -- 该批在原交接清单中的顺序号（原序引用）
-    batch_no         TEXT NOT NULL REFERENCES batch(batch_no),
+    batch_no         TEXT NOT NULL,             -- 现行批次号（随编号更正更新）
+    recorded_batch_no TEXT,                     -- 退回记录时的批次号（冻结，不改写；旧库回填）
     PRIMARY KEY (return_no, batch_no),
     UNIQUE (handover_no, batch_no)              -- 同批对同一交接至多退回一次
 );
@@ -425,6 +458,12 @@ _MIGRATION_COLUMNS = [
     ("material_lot", "merged_into", "TEXT"),
     ("material_lot", "merged_reason", "TEXT"),
     ("material_lot", "merged_at", "TEXT"),
+    # 批次号更正（标识更正）：历史快照表逐行保留“记录时的批次号”，
+    # 现行批次号列随编号更正更新；旧库回填为当时记录中的批次号。
+    ("verification_confirmation_batch", "recorded_batch_no", "TEXT"),
+    ("shipment_handover_batch", "recorded_batch_no", "TEXT"),
+    ("shipment_return_batch", "recorded_batch_no", "TEXT"),
+    ("shipment_review", "recorded_batch_no", "TEXT"),
 ]
 
 
@@ -503,6 +542,36 @@ def _backfill_eligibility(store: Store) -> None:
             )
 
 
+def _backfill_batch_no_aliases(store: Store) -> None:
+    """旧库升级：为既有批次补“现行号 -> 自身”的查询别名，并回填历史快照表的
+    recorded_batch_no（记录时的批次号）为当时记录中的批次号。幂等。"""
+    from datetime import UTC, datetime
+
+    with store.write() as conn:
+        now = datetime.now(UTC).isoformat()
+        conn.execute(
+            """INSERT OR IGNORE INTO batch_no_alias(alias_batch_no, current_batch_no, is_current, created_at)
+               SELECT batch_no, batch_no, 1, ? FROM batch""",
+            (now,),
+        )
+        conn.execute(
+            """UPDATE verification_confirmation_batch
+               SET recorded_batch_no = batch_no WHERE recorded_batch_no IS NULL"""
+        )
+        conn.execute(
+            """UPDATE shipment_handover_batch
+               SET recorded_batch_no = batch_no WHERE recorded_batch_no IS NULL"""
+        )
+        conn.execute(
+            """UPDATE shipment_return_batch
+               SET recorded_batch_no = batch_no WHERE recorded_batch_no IS NULL"""
+        )
+        conn.execute(
+            """UPDATE shipment_review
+               SET recorded_batch_no = batch_no WHERE recorded_batch_no IS NULL"""
+        )
+
+
 def initialize(store: Store, seed_demo: bool = False) -> None:
     """幂等初始化：建表、写入过敏原字典；全新库可附带演示原料批号。
 
@@ -521,6 +590,7 @@ def initialize(store: Store, seed_demo: bool = False) -> None:
     # 新索引引用迁移后新增的列：必须在列迁移补齐后再建（旧库升级场景）
     _migrate_indexes(conn)
     _backfill_eligibility(store)
+    _backfill_batch_no_aliases(store)
     with store.write():
         conn.executemany(
             "INSERT OR IGNORE INTO allergen(code, name_zh) VALUES (?, ?)",

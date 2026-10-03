@@ -653,6 +653,67 @@ def _voided_batches_in_verification(conn, verification_no: str) -> list[dict[str
     ]
 
 
+def _validate_verification_batch_nos(conn, normalized: list[str]) -> None:
+    """新核验清单/修订清单的批次号统一校验（编号更正语义）：
+
+    - 未知号 400 UNKNOWN_BATCH；
+    - 历次历史别名（只可查询）不得加入新清单：400 BATCH_NO_HISTORICAL_ALIAS；
+    - 已作废批次 400 BATCH_VOIDED。
+    """
+    placeholders = ",".join("?" * len(normalized))
+    rows = conn.execute(
+        f"""SELECT b.batch_no AS batch_no, b.status AS status,
+                   a.alias_batch_no AS alias_batch_no, a.is_current AS is_current
+            FROM batch_no_alias a
+            JOIN batch b ON b.batch_no = a.current_batch_no
+            WHERE a.alias_batch_no IN ({placeholders})""",
+        normalized,
+    ).fetchall()
+    by_submitted: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        by_submitted[r["alias_batch_no"]] = r
+    historical = [
+        bn
+        for bn in normalized
+        if (info := by_submitted.get(bn)) is not None and info["is_current"] == 0
+    ]
+    if historical:
+        raise bad_request(
+            "BATCH_NO_HISTORICAL_ALIAS",
+            "历史批次号永久保留为查询别名，不得加入新核验清单，请使用现行批次号",
+            [
+                {
+                    "batch_no": bn,
+                    "reason_code": "BATCH_NO_HISTORICAL_ALIAS",
+                    "current_batch_no": by_submitted[bn]["batch_no"],
+                    "message": (
+                        f"{bn} 是 {by_submitted[bn]['batch_no']} 的历史批次号，"
+                        "新核验清单只接受现行号"
+                    ),
+                }
+                for bn in historical
+            ],
+        )
+    voided = [
+        bn
+        for bn in normalized
+        if (info := by_submitted.get(bn)) is not None and info["status"] == "VOIDED"
+    ]
+    if voided:
+        raise bad_request(
+            "BATCH_VOIDED",
+            f"批次已作废，不能加入核验单: {', '.join(voided)}",
+            [
+                {
+                    "batch_no": bn,
+                    "reason_code": "BATCH_VOIDED",
+                    "message": "批次已作废（误登记未投产），不再参与新核验",
+                }
+                for bn in voided
+            ],
+        )
+
+
 def _reject_if_contains_voided(conn, verification_no: str) -> None:
     """含作废批次的已有单据可查询，但重新核验和确认均拒绝。"""
     voided = _voided_batches_in_verification(conn, verification_no)
@@ -677,14 +738,102 @@ def _reject_if_contains_voided(conn, verification_no: str) -> None:
 # ---------------------------------------------------------------- 序列化
 
 
+def _resolve_batch_alias(conn, batch_no: str) -> dict[str, Any] | None:
+    """按“现行号或任一历史别名”定位同一批的别名记录。
+
+    返回 {'alias_batch_no', 'current_batch_no', 'is_current'}；未登记（含已作废批次，
+    已作废批次仍在别名表中）返回 None。
+    """
+    row = conn.execute(
+        """SELECT alias_batch_no, current_batch_no, is_current
+           FROM batch_no_alias WHERE alias_batch_no = ?""",
+        (batch_no,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "alias_batch_no": row["alias_batch_no"],
+        "current_batch_no": row["current_batch_no"],
+        "is_current": row["is_current"] == 1,
+    }
+
+
+def _require_current_batch(conn, batch_no: str, *, not_found_code: str):
+    """更正/作废/清洁更正等“按现行号操作”入口的统一解析。
+
+    - 未知或已作废到查无此号（从未登记）：404 not_found_code；
+    - 命中历史别名（历次旧号，不得再登记/处理）：409 BATCH_NO_HISTORICAL_ALIAS。
+    返回现行批次行（sqlite3.Row）。
+    """
+    alias = _resolve_batch_alias(conn, batch_no)
+    if alias is None:
+        raise not_found(not_found_code, f"批次不存在: {batch_no}")
+    if not alias["is_current"]:
+        current = alias["current_batch_no"]
+        raise conflict(
+            "BATCH_NO_HISTORICAL_ALIAS",
+            (
+                f"批次号 {batch_no} 是 {current} 的历史批次号（编号已更正），"
+                "历史号永久保留为查询别名、不得再登记或凭其更正/作废；"
+                f"请使用现行批次号 {current} 操作"
+            ),
+            [
+                {
+                    "submitted_batch_no": batch_no,
+                    "current_batch_no": current,
+                    "reason_code": "BATCH_NO_HISTORICAL_ALIAS",
+                    "message": "历史批次号只作查询别名，请改用现行批次号",
+                }
+            ],
+        )
+    return conn.execute(
+        "SELECT * FROM batch WHERE batch_no = ?", (batch_no,)
+    ).fetchone()
+
+
+def _canonical_batch_map(conn, batch_nos: list[str]) -> dict[str, str]:
+    """一批已提交的批次号 -> 现行号（仅解析已知/历史别名，未知号不在返回中）。"""
+    if not batch_nos:
+        return {}
+    placeholders = ",".join("?" * len(batch_nos))
+    rows = conn.execute(
+        f"SELECT alias_batch_no, current_batch_no FROM batch_no_alias "
+        f"WHERE alias_batch_no IN ({placeholders})",
+        batch_nos,
+    ).fetchall()
+    return {r["alias_batch_no"]: r["current_batch_no"] for r in rows}
+
+
+def _batch_identity_payload(conn, current_batch_no: str) -> dict[str, Any]:
+    """批次标识信息：现行号 + 按更正先后排列的历次历史号（最早更正出的号在前）。"""
+    aliases = conn.execute(
+        """SELECT r.previous_batch_no AS previous_batch_no, r.renamed_at AS renamed_at
+           FROM batch_no_rename r
+           JOIN batch_no_alias a
+             ON a.alias_batch_no = r.previous_batch_no
+            AND a.current_batch_no = ? AND a.is_current = 0
+           ORDER BY r.id""",
+        (current_batch_no,),
+    ).fetchall()
+    return {
+        "current_batch_no": current_batch_no,
+        "previous_batch_nos": [r["previous_batch_no"] for r in aliases],
+        "alias_batch_nos": [r["previous_batch_no"] for r in aliases],
+    }
+
+
 def _batch_full(conn, row) -> dict[str, Any]:
     adj = conn.execute(
         "SELECT * FROM adjudication WHERE batch_no = ?", (row["batch_no"],)
     ).fetchone()
     ship = _get_shipment(conn, row["batch_no"])
     voided = row["status"] == "VOIDED"
+    identity = _batch_identity_payload(conn, row["batch_no"])
     return {
         "batch_no": row["batch_no"],
+        "current_batch_no": row["batch_no"],
+        "previous_batch_nos": identity["previous_batch_nos"],
+        "alias_batch_nos": identity["alias_batch_nos"],
         "line_id": row["line_id"],
         "seq": row["seq"],
         "status": row["status"],
@@ -1146,6 +1295,11 @@ class Service:
         cleaned = _normalize_allergen_list(cleaned_allergens, "cleaned_allergens")
 
         with self.store.write() as conn:
+            # 现行号与历次历史号都不可再登记（历史别名永久保留）
+            if conn.execute(
+                "SELECT 1 FROM batch_no_alias WHERE alias_batch_no = ?", (batch_no,)
+            ).fetchone():
+                raise conflict("DUPLICATE_BATCH", f"批次号重复: {batch_no}")
             if conn.execute("SELECT 1 FROM batch WHERE batch_no = ?", (batch_no,)).fetchone():
                 raise conflict("DUPLICATE_BATCH", f"批次号重复: {batch_no}")
 
@@ -1170,6 +1324,13 @@ class Service:
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (batch_no, line_id, seq, dumps(lots), dumps(declared), dumps(cleaned), now),
             )
+            # 现行号登记为指向自身的查询别名（之后编号更正只追加历史别名）
+            conn.execute(
+                """INSERT INTO batch_no_alias
+                   (alias_batch_no, current_batch_no, is_current, created_at)
+                   VALUES (?, ?, 1, ?)""",
+                (batch_no, batch_no, now),
+            )
             conn.executemany(
                 "INSERT INTO batch_material(batch_no, lot_no) VALUES (?, ?)",
                 [(batch_no, lot) for lot in lots],
@@ -1186,9 +1347,12 @@ class Service:
 
     def get_batch(self, batch_no: str) -> dict[str, Any]:
         with self.store.read() as conn:
-            row = conn.execute("SELECT * FROM batch WHERE batch_no = ?", (batch_no,)).fetchone()
-            if not row:
+            alias = _resolve_batch_alias(conn, (batch_no or "").strip())
+            if alias is None:
                 raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+            row = conn.execute(
+                "SELECT * FROM batch WHERE batch_no = ?", (alias["current_batch_no"],)
+            ).fetchone()
             return _batch_full(conn, row)
 
     def list_batches(self, line_id: str | None = None) -> list[dict[str, Any]]:
@@ -1209,11 +1373,15 @@ class Service:
         declared_allergens: list[str] | None,
         cleaned_allergens: list[str] | None,
     ) -> dict[str, Any]:
-        """更正批次的原料批号 / 声明 / 清洁核验，重算本批及后续批次。"""
+        """更正批次的原料批号 / 声明 / 清洁核验，重算本批及后续批次。
+
+        批次更正只接受现行批次号：未知号 404，历次历史别名 409
+        BATCH_NO_HISTORICAL_ALIAS（历史号仅作查询别名）。
+        """
         with self.store.write() as conn:
-            row = conn.execute("SELECT * FROM batch WHERE batch_no = ?", (batch_no,)).fetchone()
-            if not row:
-                raise not_found("CORRECTION_TARGET_NOT_FOUND", f"更正目标不存在，批次号: {batch_no}")
+            row = _require_current_batch(
+                conn, batch_no, not_found_code="CORRECTION_TARGET_NOT_FOUND"
+            )
             if row["status"] == "VOIDED":
                 raise conflict(
                     "BATCH_VOIDED",
@@ -1306,13 +1474,9 @@ class Service:
         proposed = _normalize_allergen_list(cleaned_allergens, "cleaned_allergens")
 
         with self.store.read() as conn:
-            target_row = conn.execute(
-                "SELECT * FROM batch WHERE batch_no = ?", (batch_no,)
-            ).fetchone()
-            if not target_row:
-                raise not_found(
-                    "CORRECTION_TARGET_NOT_FOUND", f"更正目标不存在，批次号: {batch_no}"
-                )
+            target_row = _require_current_batch(
+                conn, batch_no, not_found_code="CORRECTION_TARGET_NOT_FOUND"
+            )
             if target_row["status"] == "VOIDED":
                 raise conflict(
                     "BATCH_VOIDED",
@@ -1466,11 +1630,9 @@ class Service:
         if not reason:
             raise bad_request("INVALID_PAYLOAD", "reason 不能为空：批次作废必须填写原因")
         with self.store.write() as conn:
-            row = conn.execute(
-                "SELECT * FROM batch WHERE batch_no = ?", (batch_no,)
-            ).fetchone()
-            if not row:
-                raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+            row = _require_current_batch(
+                conn, batch_no, not_found_code="BATCH_NOT_FOUND"
+            )
 
             # 重复作废：返回既有结果，幂等且不重算
             if row["status"] == "VOIDED":
@@ -1533,11 +1695,9 @@ class Service:
                 "INVALID_PAYLOAD", "target_line_id 不能为空：更正归属必须指定目标产线"
             )
         with self.store.write() as conn:
-            row = conn.execute(
-                "SELECT * FROM batch WHERE batch_no = ?", (batch_no,)
-            ).fetchone()
-            if not row:
-                raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+            row = _require_current_batch(
+                conn, batch_no, not_found_code="BATCH_NOT_FOUND"
+            )
             if row["status"] == "VOIDED":
                 raise conflict(
                     "BATCH_VOIDED",
@@ -1619,17 +1779,247 @@ class Service:
             "affected_verifications": affected,
         }
 
+    # ---- 批次号更正（标识更正） ----
+
+    def rename_batch(self, batch_no: str, new_batch_no: str, reason: str) -> dict[str, Any]:
+        """已投产批次号录错时的编号更正（只改标识，不改业务内容）。
+
+        凭现行批次号、未占用的新号与非空原因更正：
+        - 同一批可连续更正；历次旧号永久保留为查询别名（batch_no_alias, is_current=0），
+          不得再登记，也不得凭历史号更正/作废——写入口只接受现行号；
+        - 当前批次、裁决、出货资格、核验单【当前】成员及发运占用均改以现行号关联同一批；
+          编号更正本身不改变裁决/出货资格版本、单据修订号与状态，也不释放发运占用；
+        - 已确认核验、交接、退回、发运后复核的历史快照保留“记录时的批次号”与内容，
+          逐批条目同时回传历史号（recorded_batch_no）与现行号（batch_no）；
+        - 未知或已作废批次、空原因、目标号为空、目标号与现行号相同、
+          目标号已被现行号或历史别名占用，均整体拒绝；单事务原子提交，
+          失败回滚，不留下部分更名或引用。
+        """
+        batch_no = (batch_no or "").strip()
+        new_batch_no = (new_batch_no or "").strip()
+        reason = (reason or "").strip()
+        if not new_batch_no:
+            raise bad_request(
+                "INVALID_PAYLOAD", "new_batch_no 不能为空：编号更正必须指定未占用的新批次号"
+            )
+        if not reason:
+            raise bad_request(
+                "INVALID_PAYLOAD", "reason 不能为空：批次号更正必须填写原因"
+            )
+        with self.store.write() as conn:
+            # 编号更正是对被外键引用的主键改名：子表随批改以现行号关联、
+            # 父表 batch 主键随后更新——延迟外键约束到提交时统一校验
+            # （提交时父子键全部一致），配合写锁保证不留下部分更名。
+            conn.execute("PRAGMA defer_foreign_keys = ON")
+            row = _require_current_batch(
+                conn, batch_no, not_found_code="BATCH_NOT_FOUND"
+            )
+            if row["status"] == "VOIDED":
+                raise conflict(
+                    "BATCH_VOIDED",
+                    f"批次已作废，不可更正批次号: {batch_no}（作废保留可查，批次号不可复用）",
+                )
+            if new_batch_no == batch_no:
+                raise conflict(
+                    "SAME_SOURCE_TARGET_BATCH_NO",
+                    f"新批次号与现行批次号相同: {batch_no}，无需更正标识",
+                    [
+                        {
+                            "batch_no": batch_no,
+                            "current_batch_no": batch_no,
+                            "new_batch_no": new_batch_no,
+                        }
+                    ],
+                )
+            # 目标号未被占用：不得是任一批次的现行号，也不得是任何批次的历史别名
+            target = _resolve_batch_alias(conn, new_batch_no)
+            if target is not None:
+                if target["is_current"]:
+                    message = (
+                        f"新批次号 {new_batch_no} 已被现行批次号占用"
+                        f"（{target['current_batch_no']}），不能更正为该号"
+                    )
+                else:
+                    message = (
+                        f"新批次号 {new_batch_no} 已被历史批次号占用"
+                        f"（现行为 {target['current_batch_no']} 的历次旧号），"
+                        "历史号永久保留、不得复用"
+                    )
+                raise conflict(
+                    "BATCH_NO_ALREADY_TAKEN",
+                    message,
+                    [
+                        {
+                            "reason_code": "BATCH_NO_ALREADY_TAKEN",
+                            "requested_batch_no": new_batch_no,
+                            "occupied_by_current_batch_no": target["current_batch_no"],
+                            "occupied_as": (
+                                "CURRENT" if target["is_current"] else "HISTORICAL_ALIAS"
+                            ),
+                            "message": message,
+                        }
+                    ],
+                )
+
+            old_batch_no = batch_no
+            now = _now()
+
+            # 1) 只追加的编号更正记录
+            cur = conn.execute(
+                """INSERT INTO batch_no_rename
+                   (previous_batch_no, new_batch_no, reason, renamed_at)
+                   VALUES (?, ?, ?, ?)""",
+                (old_batch_no, new_batch_no, reason, now),
+            )
+            rename_id = cur.lastrowid
+
+            # 2) 当前关联一律改以现行号（new_batch_no）关联同一批
+            conn.execute(
+                "UPDATE batch SET batch_no=? WHERE batch_no=?",
+                (new_batch_no, old_batch_no),
+            )
+            conn.execute(
+                "UPDATE adjudication SET batch_no=? WHERE batch_no=?",
+                (new_batch_no, old_batch_no),
+            )
+            # 裁决/出货资格历史版本：版本内容不变，仅随批把归属键更新为现行号
+            conn.execute(
+                "UPDATE adjudication_version SET batch_no=? WHERE batch_no=?",
+                (new_batch_no, old_batch_no),
+            )
+            conn.execute(
+                "UPDATE shipment_eligibility SET batch_no=? WHERE batch_no=?",
+                (new_batch_no, old_batch_no),
+            )
+            conn.execute(
+                "UPDATE shipment_eligibility_version SET batch_no=? WHERE batch_no=?",
+                (new_batch_no, old_batch_no),
+            )
+            conn.execute(
+                "UPDATE batch_material SET batch_no=? WHERE batch_no=?",
+                (new_batch_no, old_batch_no),
+            )
+            # 核验单【当前】成员改以现行号关联；修订号、状态与快照版本一律不动
+            conn.execute(
+                "UPDATE verification_batch SET batch_no=? WHERE batch_no=?",
+                (new_batch_no, old_batch_no),
+            )
+            # 发运占用随批更名，不释放（仍占用发运名额）
+            conn.execute(
+                "UPDATE shipment_handover_occupancy SET batch_no=? WHERE batch_no=?",
+                (new_batch_no, old_batch_no),
+            )
+
+            # 3) 历史快照表保留记录时的批次号：先把“记录时号”落到 recorded_batch_no
+            #    （该批首次更名时这些行的 recorded_batch_no 仍为旧现行号），
+            #    再把现行号列更新为新号；之后连续更名 recorded_batch_no 保持首个记录时号。
+            for table in (
+                "verification_confirmation_batch",
+                "shipment_handover_batch",
+                "shipment_return_batch",
+                "shipment_review",
+            ):
+                conn.execute(
+                    f"UPDATE {table} SET recorded_batch_no = batch_no "
+                    "WHERE batch_no = ? AND recorded_batch_no IS NULL",
+                    (old_batch_no,),
+                )
+                conn.execute(
+                    f"UPDATE {table} SET batch_no=? WHERE batch_no=?",
+                    (new_batch_no, old_batch_no),
+                )
+
+            # 4) 别名：该批此前的全部别名（历次历史号 + 旧现行号自别名）改指向新现行号，
+            #    旧现行号转为历史别名；新现行号登记指向自身
+            conn.execute(
+                """UPDATE batch_no_alias
+                   SET current_batch_no=?, is_current=0
+                   WHERE current_batch_no=?""",
+                (new_batch_no, old_batch_no),
+            )
+            conn.execute(
+                """INSERT INTO batch_no_alias
+                   (alias_batch_no, current_batch_no, is_current, created_at)
+                   VALUES (?, ?, 1, ?)""",
+                (new_batch_no, new_batch_no, now),
+            )
+
+            full = _batch_full(
+                conn,
+                conn.execute(
+                    "SELECT * FROM batch WHERE batch_no = ?", (new_batch_no,)
+                ).fetchone(),
+            )
+            rename = {
+                "rename_id": rename_id,
+                "previous_batch_no": old_batch_no,
+                "new_batch_no": new_batch_no,
+                "reason": reason,
+                "renamed_at": now,
+            }
+
+        return {
+            "renamed": full,
+            "rename": rename,
+            "identity": {
+                "current_batch_no": new_batch_no,
+                "previous_batch_nos": full["previous_batch_nos"],
+                "alias_batch_nos": full["alias_batch_nos"],
+            },
+            "changed": True,
+        }
+
+    def list_batch_renames(self, batch_no: str | None = None) -> dict[str, Any]:
+        """列出批次号更正记录（只追加）；可按现行号或历次历史别名过滤到同一批。"""
+        with self.store.read() as conn:
+            if batch_no:
+                alias = _resolve_batch_alias(conn, batch_no.strip())
+                if alias is None:
+                    raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+                current = alias["current_batch_no"]
+                # 每次更正：previous 是历史别名、new 在更正当下成为现行号；
+                # 连续更名后中间号也是历史别名，因此以别名表反查该批的全部记录。
+                rows = conn.execute(
+                    """SELECT r.* FROM batch_no_rename r
+                       JOIN batch_no_alias a
+                         ON (a.alias_batch_no = r.previous_batch_no
+                             OR a.alias_batch_no = r.new_batch_no)
+                        AND a.current_batch_no = ?
+                       GROUP BY r.id ORDER BY r.id""",
+                    (current,),
+                ).fetchall()
+                return {
+                    "batch_no": current,
+                    "queried_batch_no": alias["alias_batch_no"],
+                    "current_batch_no": current,
+                    "previous_batch_nos": _batch_identity_payload(conn, current)[
+                        "previous_batch_nos"
+                    ],
+                    "renames": [_batch_rename_payload(r) for r in rows],
+                }
+            rows = conn.execute(
+                "SELECT * FROM batch_no_rename ORDER BY id"
+            ).fetchall()
+            return {"renames": [_batch_rename_payload(r) for r in rows]}
+
     def batch_history(self, batch_no: str) -> dict[str, Any]:
         with self.store.read() as conn:
-            row = conn.execute("SELECT * FROM batch WHERE batch_no = ?", (batch_no,)).fetchone()
-            if not row:
+            alias = _resolve_batch_alias(conn, (batch_no or "").strip())
+            if alias is None:
                 raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+            current = alias["current_batch_no"]
+            row = conn.execute("SELECT * FROM batch WHERE batch_no = ?", (current,)).fetchone()
             versions = conn.execute(
                 "SELECT * FROM adjudication_version WHERE batch_no = ? ORDER BY version",
-                (batch_no,),
+                (current,),
             ).fetchall()
+            identity = _batch_identity_payload(conn, current)
             return {
-                "batch_no": batch_no,
+                "batch_no": current,
+                "queried_batch_no": alias["alias_batch_no"],
+                "current_batch_no": current,
+                "previous_batch_nos": identity["previous_batch_nos"],
+                "alias_batch_nos": identity["alias_batch_nos"],
                 "line_id": row["line_id"],
                 "seq": row["seq"],
                 "status": row["status"],
@@ -1656,13 +2046,14 @@ class Service:
     # ---- 出货资格 ----
 
     def get_shipment_eligibility(self, batch_no: str) -> dict[str, Any]:
-        """查询单批当前出货资格及其历次版本。"""
+        """查询单批当前出货资格及其历次版本（可凭现行号或历次历史别名查询）。"""
         with self.store.read() as conn:
-            row = conn.execute(
-                "SELECT * FROM batch WHERE batch_no = ?", (batch_no,)
-            ).fetchone()
-            if not row:
+            alias = _resolve_batch_alias(conn, (batch_no or "").strip())
+            if alias is None:
                 raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+            row = conn.execute(
+                "SELECT * FROM batch WHERE batch_no = ?", (alias["current_batch_no"],)
+            ).fetchone()
             return _eligibility_payload(conn, row)
 
     def list_shipment_eligibility(
@@ -1723,9 +2114,10 @@ class Service:
 
             placeholders = ",".join("?" * len(normalized))
             known = {
-                r["batch_no"]
+                r["alias_batch_no"]
                 for r in conn.execute(
-                    f"SELECT batch_no FROM batch WHERE batch_no IN ({placeholders})",
+                    f"SELECT alias_batch_no FROM batch_no_alias "
+                    f"WHERE alias_batch_no IN ({placeholders})",
                     normalized,
                 ).fetchall()
             }
@@ -1735,29 +2127,8 @@ class Service:
                     "UNKNOWN_BATCH", f"未知批次（未登记）: {', '.join(unknown)}"
                 )
 
-            # 作废批次不再参与新核验
-            voided = [
-                r["batch_no"]
-                for r in conn.execute(
-                    f"""SELECT batch_no FROM batch
-                        WHERE batch_no IN ({placeholders}) AND status = 'VOIDED'
-                        ORDER BY batch_no""",
-                    normalized,
-                ).fetchall()
-            ]
-            if voided:
-                raise bad_request(
-                    "BATCH_VOIDED",
-                    f"批次已作废，不能加入新核验单: {', '.join(voided)}",
-                    [
-                        {
-                            "batch_no": bn,
-                            "reason_code": "BATCH_VOIDED",
-                            "message": "批次已作废（误登记未投产），不再参与新核验",
-                        }
-                        for bn in voided
-                    ],
-                )
+            # 历史别名不得加入新核验单；作废批次不再参与新核验
+            _validate_verification_batch_nos(conn, normalized)
 
             now = _now()
             conn.execute(
@@ -1902,9 +2273,10 @@ class Service:
 
             placeholders = ",".join("?" * len(normalized))
             known = {
-                r["batch_no"]
+                r["alias_batch_no"]
                 for r in conn.execute(
-                    f"SELECT batch_no FROM batch WHERE batch_no IN ({placeholders})",
+                    f"SELECT alias_batch_no FROM batch_no_alias "
+                    f"WHERE alias_batch_no IN ({placeholders})",
                     normalized,
                 ).fetchall()
             }
@@ -1914,30 +2286,9 @@ class Service:
                     "UNKNOWN_BATCH", f"未知批次（未登记）: {', '.join(unknown)}"
                 )
 
-            # 新清单中的批次必须全部有效；允许移除旧清单中的已作废批次，
-            # 但不允许再次加入任何已作废批次。
-            voided = [
-                r["batch_no"]
-                for r in conn.execute(
-                    f"""SELECT batch_no FROM batch
-                        WHERE batch_no IN ({placeholders}) AND status = 'VOIDED'
-                        ORDER BY batch_no""",
-                    normalized,
-                ).fetchall()
-            ]
-            if voided:
-                raise bad_request(
-                    "BATCH_VOIDED",
-                    f"批次已作废，不能加入核验单: {', '.join(voided)}",
-                    [
-                        {
-                            "batch_no": bn,
-                            "reason_code": "BATCH_VOIDED",
-                            "message": "批次已作废（误登记未投产），新清单中的批次必须全部有效",
-                        }
-                        for bn in voided
-                    ],
-                )
+            # 新清单中的批次必须全部有效；历史别名不得加入新清单，
+            # 允许移除旧清单中的已作废批次，但不允许再次加入任何已作废批次。
+            _validate_verification_batch_nos(conn, normalized)
 
             # 校验全部通过后才重写成员与逐批快照：失败路径不执行 DELETE，
             # 当前成员与快照保持原样。
@@ -2224,6 +2575,7 @@ class Service:
             # 5) 逐批关联：最近一次确认快照 + 当前裁决/出货资格 + 批次状态 + 是否已占用
             rows = conn.execute(
                 """SELECT vcb.position AS position, vcb.batch_no AS batch_no,
+                          vcb.recorded_batch_no AS recorded_batch_no,
                           vcb.snapshot_version AS snap_version,
                           vcb.snapshot_disposition AS snap_disposition,
                           vcb.snapshot_actual AS snap_actual,
@@ -2427,16 +2779,17 @@ class Service:
             )
             conn.executemany(
                 """INSERT INTO shipment_handover_batch
-                   (handover_no, position, batch_no, confirmation_id, snapshot_version,
-                    snapshot_disposition, snapshot_actual, snapshot_undeclared, snapshot_reasons,
-                    snapshot_ship_version, snapshot_ship_status,
+                   (handover_no, position, batch_no, recorded_batch_no, confirmation_id,
+                    snapshot_version, snapshot_disposition, snapshot_actual, snapshot_undeclared,
+                    snapshot_reasons, snapshot_ship_version, snapshot_ship_status,
                     snapshot_locked_lots, snapshot_ship_reasons)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         handover_no,
                         r["position"],
                         r["batch_no"],
+                        r["recorded_batch_no"] or r["batch_no"],
                         confirmation_id,
                         r["snap_version"],
                         r["snap_disposition"],
@@ -2498,10 +2851,10 @@ class Service:
         """
         batch_no = (batch_no or "").strip()
         with self.store.read() as conn:
-            if not conn.execute(
-                "SELECT 1 FROM batch WHERE batch_no = ?", (batch_no,)
-            ).fetchone():
+            alias = _resolve_batch_alias(conn, batch_no)
+            if alias is None:
                 raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+            current = alias["current_batch_no"]
 
             rows = conn.execute(
                 """SELECT ho.handover_no AS handover_no, ho.verification_no AS verification_no,
@@ -2510,8 +2863,10 @@ class Service:
                           ho.confirmed_at AS confirmed_at,
                           ho.handed_over_at AS handed_over_at,
                           hb.position AS position,
+                          hb.recorded_batch_no AS recorded_batch_no,
                           oc.handover_no AS outstanding_handover,
                           rb.return_no AS return_no,
+                          rb.recorded_batch_no AS return_recorded_batch_no,
                           sr.reason AS return_reason,
                           sr.returned_at AS returned_at
                    FROM shipment_handover_batch hb
@@ -2522,11 +2877,11 @@ class Service:
                    LEFT JOIN shipment_return sr ON sr.return_no = rb.return_no
                    WHERE hb.batch_no = ?
                    ORDER BY ho.handed_over_at, ho.handover_no""",
-                (batch_no,),
+                (current,),
             ).fetchall()
 
             handovers: list[dict[str, Any]] = []
-            current = None
+            current_entry = None
             for r in rows:
                 returned = r["return_no"] is not None
                 entry = {
@@ -2535,6 +2890,9 @@ class Service:
                     "verification_revision": r["verification_revision"],
                     "confirmation_id": r["confirmation_id"],
                     "position": r["position"],
+                    "batch_no": current,
+                    "current_batch_no": current,
+                    "recorded_batch_no": r["recorded_batch_no"] or current,
                     "confirmed_at": r["confirmed_at"],
                     "handed_over_at": r["handed_over_at"],
                     "returned": returned,
@@ -2542,6 +2900,10 @@ class Service:
                     if not returned
                     else {
                         "return_no": r["return_no"],
+                        "recorded_batch_no": r["return_recorded_batch_no"]
+                        or r["recorded_batch_no"]
+                        or current,
+                        "current_batch_no": current,
                         "reason": r["return_reason"],
                         "returned_at": r["returned_at"],
                     },
@@ -2549,13 +2911,18 @@ class Service:
                 handovers.append(entry)
                 # occupancy 每批至多一行，且仅在其仍属于未退回交接时存在
                 if r["outstanding_handover"] == r["handover_no"]:
-                    current = entry
+                    current_entry = entry
 
             return {
-                "batch_no": batch_no,
-                "shipped": current is not None,
-                "handover": None if current is None else _current_handover_view(current),
-                "current_whereabouts": _current_whereabouts(batch_no, current),
+                "batch_no": current,
+                "queried_batch_no": batch_no,
+                "current_batch_no": current,
+                "previous_batch_nos": _batch_identity_payload(conn, current)[
+                    "previous_batch_nos"
+                ],
+                "shipped": current_entry is not None,
+                "handover": None if current_entry is None else _current_handover_view(current_entry),
+                "current_whereabouts": _current_whereabouts(current, current_entry),
                 "handovers": handovers,
             }
 
@@ -2619,40 +2986,51 @@ class Service:
                     "HANDOVER_NOT_FOUND", f"装车交接记录不存在: {handover_no}"
                 )
 
-            # 3) 原交接逐批成员 + 各批是否已有退回记录（同一交接每批至多退一次）
-            members = {
-                r["batch_no"]: r
-                for r in conn.execute(
-                    """SELECT hb.batch_no AS batch_no, hb.position AS position,
-                              rb.return_no AS returned_in
-                       FROM shipment_handover_batch hb
-                       LEFT JOIN shipment_return_batch rb
-                              ON rb.handover_no = hb.handover_no
-                             AND rb.batch_no = hb.batch_no
-                       WHERE hb.handover_no = ?""",
-                    (handover_no,),
-                ).fetchall()
-            }
+            # 3) 原交接逐批成员 + 各批是否已有退回记录（同一交接每批至多退一次）。
+            #    成员按现行号关联；提交清单可凭记录时的历史号（recorded_batch_no）或
+            #    现行号定位同一批（按旧号处理原交接的退回仍可定位）。
+            member_rows = conn.execute(
+                """SELECT hb.batch_no AS batch_no,
+                          hb.recorded_batch_no AS recorded_batch_no,
+                          hb.position AS position,
+                          rb.return_no AS returned_in
+                   FROM shipment_handover_batch hb
+                   LEFT JOIN shipment_return_batch rb
+                          ON rb.handover_no = hb.handover_no
+                         AND rb.batch_no = hb.batch_no
+                   WHERE hb.handover_no = ?""",
+                (handover_no,),
+            ).fetchall()
+            members: dict[str, dict[str, Any]] = {}
+            for r in member_rows:
+                members[r["batch_no"]] = r
+                recorded = r["recorded_batch_no"] or r["batch_no"]
+                # 记录时批次号也可定位到同一成员（历史号只追加，不与现行号冲突）
+                members.setdefault(recorded, r)
 
             # 4) 逐批校验：非本交接批次（含未知批次）/ 已退回批次 -> 整批收集后整体拒绝
             problems: list[dict[str, Any]] = []
-            for bn in normalized:
-                m = members.get(bn)
+            resolved_members: list[tuple[str, dict[str, Any]]] = []
+            for submitted in normalized:
+                m = members.get(submitted)
                 if m is None:
                     problems.append(
                         {
-                            "batch_no": bn,
+                            "batch_no": submitted,
                             "reason_code": "BATCH_NOT_IN_HANDOVER",
                             "message": (
                                 f"批次不属于交接 {handover_no}（或批次未登记），"
-                                "退回清单只能包含该交接内的批次"
+                                "退回清单只能包含该交接内的批次；可凭现行号或交接记录时批次号提交"
                             ),
                         }
                     )
-                elif m["returned_in"] is not None:
+                    continue
+                resolved_members.append((submitted, m))
+                if m["returned_in"] is not None:
                     problems.append(
                         {
-                            "batch_no": bn,
+                            "batch_no": submitted,
+                            "current_batch_no": m["batch_no"],
                             "reason_code": "BATCH_ALREADY_RETURNED",
                             "return_no": m["returned_in"],
                             "message": (
@@ -2678,11 +3056,17 @@ class Service:
             )
             conn.executemany(
                 """INSERT INTO shipment_return_batch
-                   (return_no, handover_no, position, batch_no)
-                   VALUES (?, ?, ?, ?)""",
+                   (return_no, handover_no, position, batch_no, recorded_batch_no)
+                   VALUES (?, ?, ?, ?, ?)""",
                 [
-                    (return_no, handover_no, members[bn]["position"], bn)
-                    for bn in normalized
+                    (
+                        return_no,
+                        handover_no,
+                        m["position"],
+                        m["batch_no"],
+                        m["recorded_batch_no"] or m["batch_no"],
+                    )
+                    for _submitted, m in resolved_members
                 ],
             )
             # 仅释放本笔退回清单内、当前仍由本交接占用的批次。
@@ -2691,7 +3075,7 @@ class Service:
             conn.executemany(
                 """DELETE FROM shipment_handover_occupancy
                    WHERE batch_no = ? AND handover_no = ?""",
-                [(bn, handover_no) for bn in normalized],
+                [(m["batch_no"], handover_no) for _submitted, m in resolved_members],
             )
 
             rrow = conn.execute(
@@ -2799,6 +3183,20 @@ class Service:
             if not hrow:
                 raise not_found("HANDOVER_NOT_FOUND", f"装车交接记录不存在: {handover_no}")
 
+            # 凭交接记录时批次号（历史号）或现行号均可定位原交接的该批
+            member = conn.execute(
+                """SELECT batch_no, recorded_batch_no FROM shipment_handover_batch
+                   WHERE handover_no = ?
+                     AND (batch_no = ? OR recorded_batch_no = ?)""",
+                (handover_no, batch_no, batch_no),
+            ).fetchone()
+            if not member:
+                raise not_found(
+                    "BATCH_NOT_IN_HANDOVER",
+                    f"批次不属于该交接记录: 交接 {handover_no}，批次 {batch_no}",
+                )
+            resolved_batch_no = member["batch_no"]
+
             frozen = conn.execute(
                 """SELECT hb.*, b.status AS batch_status,
                           a.version AS cur_adj_version, a.disposition AS cur_disposition,
@@ -2808,13 +3206,8 @@ class Service:
                    LEFT JOIN adjudication a ON a.batch_no = hb.batch_no
                    LEFT JOIN shipment_eligibility se ON se.batch_no = hb.batch_no
                    WHERE hb.handover_no = ? AND hb.batch_no = ?""",
-                (handover_no, batch_no),
+                (handover_no, resolved_batch_no),
             ).fetchone()
-            if not frozen:
-                raise not_found(
-                    "BATCH_NOT_IN_HANDOVER",
-                    f"批次不属于该交接记录: 交接 {handover_no}，批次 {batch_no}",
-                )
 
             # 过期所见状态：以数据库当前状态为准，三类所见信息任一不符即拒绝
             cur_voided = frozen["batch_status"] == "VOIDED"
@@ -2885,7 +3278,7 @@ class Service:
                      AND seen_batch_voided = ?""",
                 (
                     handover_no,
-                    batch_no,
+                    resolved_batch_no,
                     seen_adjudication_version,
                     seen_shipment_version,
                     1 if seen_batch_voided else 0,
@@ -2902,7 +3295,10 @@ class Service:
                         {
                             "reason_code": "REVIEW_ALREADY_RECORDED",
                             "handover_no": handover_no,
-                            "batch_no": batch_no,
+                            "batch_no": resolved_batch_no,
+                            "current_batch_no": resolved_batch_no,
+                            "recorded_batch_no": frozen["recorded_batch_no"]
+                            or resolved_batch_no,
                             "seen_adjudication_version": seen_adjudication_version,
                             "seen_shipment_version": seen_shipment_version,
                             "seen_batch_voided": bool(seen_batch_voided),
@@ -2915,13 +3311,14 @@ class Service:
             try:
                 cur = conn.execute(
                     """INSERT INTO shipment_review
-                       (handover_no, batch_no, position,
+                       (handover_no, batch_no, recorded_batch_no, position,
                         seen_adjudication_version, seen_shipment_version, seen_batch_voided,
                         disposition, reason, reviewed_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         handover_no,
-                        batch_no,
+                        resolved_batch_no,
+                        frozen["recorded_batch_no"] or resolved_batch_no,
                         frozen["position"],
                         seen_adjudication_version,
                         seen_shipment_version,
@@ -2941,7 +3338,9 @@ class Service:
             hb_row = conn.execute(
                 "SELECT * FROM shipment_handover WHERE handover_no = ?", (handover_no,)
             ).fetchone()
-            item = _shipment_review_batches(conn, hb_row, batch_nos=(batch_no,))
+            item = _shipment_review_batches(
+                conn, hb_row, batch_nos=(resolved_batch_no,)
+            )
             return {
                 "handover_no": handover_no,
                 "review_id": cur.lastrowid,
@@ -3001,6 +3400,17 @@ def _material_lot_payload(conn, row) -> dict[str, Any]:
         "merged_at": row["merged_at"],
         "updated_at": row["updated_at"],
         "lock": _lock_state_payload(lock),
+    }
+
+
+def _batch_rename_payload(row) -> dict[str, Any]:
+    """batch_no_rename 行 -> 编号更正记录负载（只追加、不可变）。"""
+    return {
+        "rename_id": row["id"],
+        "previous_batch_no": row["previous_batch_no"],
+        "new_batch_no": row["new_batch_no"],
+        "reason": row["reason"],
+        "renamed_at": row["renamed_at"],
     }
 
 
@@ -3072,6 +3482,10 @@ def _eligibility_payload(conn, batch_row) -> dict[str, Any]:
     ).fetchall()
     return {
         "batch_no": batch_row["batch_no"],
+        "current_batch_no": batch_row["batch_no"],
+        "previous_batch_nos": _batch_identity_payload(conn, batch_row["batch_no"])[
+            "previous_batch_nos"
+        ],
         "line_id": batch_row["line_id"],
         "seq": batch_row["seq"],
         "status": batch_row["status"],
@@ -3320,6 +3734,10 @@ def _verification_batches(conn, verification_no: str) -> list[dict[str, Any]]:
             {
                 "position": r["position"],
                 "batch_no": r["batch_no"],
+                "current_batch_no": r["batch_no"],
+                "previous_batch_nos": _batch_identity_payload(conn, r["batch_no"])[
+                    "previous_batch_nos"
+                ],
                 "line_id": r["line_id"],
                 "seq": r["seq"],
                 "status": r["batch_status"],
@@ -3356,7 +3774,7 @@ def _confirmation_history(conn, verification_no: str) -> list[dict[str, Any]]:
     history = []
     for c in confirms:
         crows = conn.execute(
-            """SELECT position, batch_no, snapshot_version, snapshot_disposition,
+            """SELECT position, batch_no, recorded_batch_no, snapshot_version, snapshot_disposition,
                       snapshot_actual, snapshot_undeclared, snapshot_reasons,
                       snapshot_ship_version, snapshot_ship_status,
                       snapshot_locked_lots, snapshot_ship_reasons
@@ -3372,6 +3790,9 @@ def _confirmation_history(conn, verification_no: str) -> list[dict[str, Any]]:
                     {
                         "position": cr["position"],
                         "batch_no": cr["batch_no"],
+                        # 历史确认快照保留记录时的批次号；同时回传现行号
+                        "recorded_batch_no": cr["recorded_batch_no"] or cr["batch_no"],
+                        "current_batch_no": cr["batch_no"],
                         "version": cr["snapshot_version"],
                         "disposition": cr["snapshot_disposition"],
                         "actual_allergens": loads(cr["snapshot_actual"]),
@@ -3479,29 +3900,34 @@ def _return_index(conn, handover_no: str) -> dict[str, dict[str, Any]]:
     同一 (handover_no, batch_no) 至多一条退回记录（UNIQUE 兜底）。
     """
     rows = conn.execute(
-        """SELECT rb.batch_no AS batch_no, rb.position AS position,
+        """SELECT rb.batch_no AS batch_no, rb.recorded_batch_no AS recorded_batch_no,
+                  rb.position AS position,
                   sr.return_no AS return_no, sr.reason AS reason, sr.returned_at AS returned_at
            FROM shipment_return_batch rb
            JOIN shipment_return sr ON sr.return_no = rb.return_no
            WHERE rb.handover_no = ?""",
         (handover_no,),
     ).fetchall()
-    return {
-        r["batch_no"]: {
+    index: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        entry = {
             "return_no": r["return_no"],
             "position": r["position"],
+            "recorded_batch_no": r["recorded_batch_no"] or r["batch_no"],
+            "current_batch_no": r["batch_no"],
             "reason": r["reason"],
             "returned_at": r["returned_at"],
         }
-        for r in rows
-    }
+        index[r["batch_no"]] = entry
+        index[r["recorded_batch_no"] or r["batch_no"]] = entry
+    return index
 
 
 def _handover_batches(conn, handover_no: str) -> list[dict[str, Any]]:
     """交接记录中逐批冻结的确认快照（不可变副本），附各批退回标记与退回引用。"""
     returned_by_batch = _return_index(conn, handover_no)
     rows = conn.execute(
-        """SELECT position, batch_no, confirmation_id, snapshot_version,
+        """SELECT position, batch_no, recorded_batch_no, confirmation_id, snapshot_version,
                   snapshot_disposition, snapshot_actual, snapshot_undeclared, snapshot_reasons,
                   snapshot_ship_version, snapshot_ship_status,
                   snapshot_locked_lots, snapshot_ship_reasons
@@ -3513,6 +3939,9 @@ def _handover_batches(conn, handover_no: str) -> list[dict[str, Any]]:
         {
             "position": r["position"],
             "batch_no": r["batch_no"],
+            # 交接冻结快照保留记录时的批次号；现行号随编号更正更新，二者同时返回
+            "recorded_batch_no": r["recorded_batch_no"] or r["batch_no"],
+            "current_batch_no": r["batch_no"],
             "confirmation_id": r["confirmation_id"],
             "adjudication": {
                 "version": r["snapshot_version"],
@@ -3545,9 +3974,14 @@ def _handover_returns(conn, handover_no: str) -> list[dict[str, Any]]:
     returns: list[dict[str, Any]] = []
     for r in rows:
         members = [
-            {"position": m["position"], "batch_no": m["batch_no"]}
+            {
+                "position": m["position"],
+                "batch_no": m["batch_no"],
+                "recorded_batch_no": m["recorded_batch_no"] or m["batch_no"],
+                "current_batch_no": m["batch_no"],
+            }
             for m in conn.execute(
-                """SELECT position, batch_no FROM shipment_return_batch
+                """SELECT position, batch_no, recorded_batch_no FROM shipment_return_batch
                    WHERE return_no = ? ORDER BY position""",
                 (r["return_no"],),
             ).fetchall()
@@ -3587,9 +4021,14 @@ def _handover_payload(conn, row) -> dict[str, Any]:
 def _handover_summary(conn, row) -> dict[str, Any]:
     """交接列表项：含成员顺序/批号与退回汇总，不含逐批快照详情。"""
     members = [
-        {"position": r["position"], "batch_no": r["batch_no"]}
+        {
+            "position": r["position"],
+            "batch_no": r["batch_no"],
+            "recorded_batch_no": r["recorded_batch_no"] or r["batch_no"],
+            "current_batch_no": r["batch_no"],
+        }
         for r in conn.execute(
-            """SELECT position, batch_no FROM shipment_handover_batch
+            """SELECT position, batch_no, recorded_batch_no FROM shipment_handover_batch
                WHERE handover_no = ? ORDER BY position""",
             (row["handover_no"],),
         ).fetchall()
@@ -3619,7 +4058,7 @@ def _return_batches(conn, row) -> list[dict[str, Any]]:
     hb_rows = {
         r["batch_no"]: r
         for r in conn.execute(
-            """SELECT batch_no, position, snapshot_version, snapshot_disposition,
+            """SELECT batch_no, position, recorded_batch_no, snapshot_version, snapshot_disposition,
                       snapshot_actual, snapshot_undeclared, snapshot_reasons,
                       snapshot_ship_version, snapshot_ship_status,
                       snapshot_locked_lots, snapshot_ship_reasons
@@ -3628,7 +4067,7 @@ def _return_batches(conn, row) -> list[dict[str, Any]]:
         ).fetchall()
     }
     members = conn.execute(
-        """SELECT position, batch_no FROM shipment_return_batch
+        """SELECT position, batch_no, recorded_batch_no FROM shipment_return_batch
            WHERE return_no = ? ORDER BY position""",
         (row["return_no"],),
     ).fetchall()
@@ -3639,6 +4078,9 @@ def _return_batches(conn, row) -> list[dict[str, Any]]:
             {
                 "position": m["position"],
                 "batch_no": m["batch_no"],
+                # 退回记录保留记录时批次号，同时回传现行号
+                "recorded_batch_no": m["recorded_batch_no"] or m["batch_no"],
+                "current_batch_no": m["batch_no"],
                 # 冻结快照引用：内容来自原交接的不可变副本（退回记录不复制、不改写）
                 "handover_snapshot": {
                     "adjudication": {
@@ -3681,9 +4123,14 @@ def _return_payload(conn, row) -> dict[str, Any]:
 def _return_summary(conn, row) -> dict[str, Any]:
     """退回列表项：不含冻结快照明细，仅成员原序/批号。"""
     members = [
-        {"position": r["position"], "batch_no": r["batch_no"]}
-        for r in conn.execute(
-            """SELECT position, batch_no FROM shipment_return_batch
+        {
+            "position": m["position"],
+            "batch_no": m["batch_no"],
+            "recorded_batch_no": m["recorded_batch_no"] or m["batch_no"],
+            "current_batch_no": m["batch_no"],
+        }
+        for m in conn.execute(
+            """SELECT position, batch_no, recorded_batch_no FROM shipment_return_batch
                WHERE return_no = ? ORDER BY position""",
             (row["return_no"],),
         ).fetchall()
@@ -3736,8 +4183,8 @@ def _current_whereabouts(batch_no: str, current: dict[str, Any] | None) -> dict[
 def _review_history(conn, handover_no: str, batch_no: str) -> list[dict[str, Any]]:
     """单批复核处置的只追加历史（按处置先后）。"""
     rows = conn.execute(
-        """SELECT id, position, seen_adjudication_version, seen_shipment_version,
-                  seen_batch_voided, disposition, reason, reviewed_at
+        """SELECT id, position, recorded_batch_no, seen_adjudication_version,
+                  seen_shipment_version, seen_batch_voided, disposition, reason, reviewed_at
            FROM shipment_review
            WHERE handover_no = ? AND batch_no = ? ORDER BY id""",
         (handover_no, batch_no),
@@ -3746,6 +4193,8 @@ def _review_history(conn, handover_no: str, batch_no: str) -> list[dict[str, Any
         {
             "review_id": r["id"],
             "position": r["position"],
+            "recorded_batch_no": r["recorded_batch_no"] or batch_no,
+            "current_batch_no": batch_no,
             "seen_state": {
                 "adjudication_version": r["seen_adjudication_version"],
                 "shipment_version": r["seen_shipment_version"],
@@ -3768,6 +4217,7 @@ def _shipment_review_batches(conn, hrow, batch_nos: tuple[str, ...] | None = Non
     仅读取，不依赖核验单当前状态——交接记录本身不可变，复核以其冻结快照为基准。
     """
     sql = """SELECT hb.position AS position, hb.batch_no AS batch_no,
+                    hb.recorded_batch_no AS recorded_batch_no,
                     hb.snapshot_version AS snap_version,
                     hb.snapshot_disposition AS snap_disposition,
                     hb.snapshot_actual AS snap_actual,
@@ -3891,6 +4341,8 @@ def _shipment_review_batches(conn, hrow, batch_nos: tuple[str, ...] | None = Non
             {
                 "position": r["position"],
                 "batch_no": bn,
+                "current_batch_no": bn,
+                "recorded_batch_no": r["recorded_batch_no"] or bn,
                 "status": r["batch_status"],
                 "voided": cur_voided,
                 "voided_reason": r["voided_reason"],

@@ -51,6 +51,16 @@
 快照不变；并发的批次更正或批号锁定在写事务内串行化，逐批快照取自同一事务快照，
 单据不会混入不同时间的快照。重新核验、确认等其他单据快照写入同样推进修订号。
 
+**现场发现已投产批次号录错**时，可凭**现行批次号、未占用的新号和非空原因**更正标识
+（`POST /api/batches/{batch_no}/rename`）。同一批**可连续更正**，**历次旧号永久保留
+为查询别名、不得再登记**，也不得凭历史号更正/作废（写入口只接受现行号）。**当前
+批次、裁决、出货资格、核验单成员及发运占用均以现行号关联同一批**；编号更正本身
+**不改变**裁决/出货资格版本、单据修订号与状态，**也不释放发运占用**。**已确认核验、
+交接、退回与发运后复核的历史快照保留记录时的批次号与内容**，逐批同时返回
+`recorded_batch_no`（历史号）与 `current_batch_no`（现行号）；**按旧号查询或处理原
+交接的退回、复核仍可定位该批**，**新核验清单只接受现行号**。未知或已作废批次、空
+原因、目标号已被现行号或历史别名占用均**整体拒绝**，失败不留下部分更名或引用。
+
 **仓库完成装车交接**时，工作人员凭**唯一交接号、已确认核验单号及读取时修订号**
 登记整单发运（`POST /api/handovers`）。交接只接受**仍为已确认（CONFIRMED）且修订号
 匹配**的单据；单内每个批次须**有效（ACTIVE）**，且**当前裁决版本/出货资格版本与最近一次
@@ -192,6 +202,80 @@
 | 目标线与原产线相同 | 409 | `SAME_SOURCE_TARGET_LINE` |
 | `target_line_id` 为空/纯空白或缺字段 | 400/422 | `INVALID_PAYLOAD` / FastAPI 校验 |
 
+### 已投产批次号更正（标识更正）
+
+现场发现**已投产批次号录错**时，可凭**现行批次号、未占用的新号和非空原因**更正标识
+（`POST /api/batches/{batch_no}/rename`，请求体 `{"new_batch_no","reason"}`）：
+
+- **只改标识、可连续更正**：只更换批次号，**产线/顺序号、用料/声明/清洁、当前裁决与
+  出货资格及其版本、核验单状态与修订号、发运占用一律不变**（不追加任何裁决/资格版本、
+  不转待复核、不释放占用）。同一批可连续更名（B1→B2→B3），每次更正写入一条**只追加、
+  不可变**的更正记录（`GET /api/batch-renames`，可按现行号或历次历史号过滤同一批）。
+- **历次旧号永久保留为查询别名**：每次更名的原现行号转为该批的历史别名（`is_current=0`）。
+  批次详情/列表、历史裁决、出货资格、单据逐批记录均回显 `current_batch_no`（现行号）与
+  `previous_batch_nos` / `alias_batch_nos`（按更正先后排列的历次旧号）。
+- **旧号只可查、不可写**：按旧号 `GET /api/batches/{old}`、
+  `GET /api/batches/{old}/history`、`GET /api/batches/{old}/eligibility`、
+  `GET /api/batches/{old}/handover`、以及原交接的复核视图均能定位同一批；但**旧号不得再
+  登记**（409 `DUPLICATE_BATCH`），凭旧号更正内容/清洁/作废/换线一律 409
+  `BATCH_NO_HISTORICAL_ALIAS`（须改用现行号），**新核验清单/修订清单只接受现行号**
+  （历史别名 400 `BATCH_NO_HISTORICAL_ALIAS`，`details` 给出 `current_batch_no`）。
+- **当前关联全部随现行号**：`batch` / `adjudication(_version)` /
+  `shipment_eligibility(_version)` / `batch_material` / 核验单【当前成员】
+  `verification_batch` / 发运占用 `shipment_handover_occupancy` 均在同一事务内改以新号关联；
+  因此批次更正重算、批号锁定联动、出货资格统计、核验/交接门禁等后续行为与未更名完全一致。
+- **历史快照保留记录时号与内容**：历次确认逐批快照（`verification_confirmation_batch`）、
+  交接冻结快照（`shipment_handover_batch`）、退回逐批成员（`shipment_return_batch`）与
+  发运后复核处置（`shipment_review`）只改“现行号关联列”，新增 `recorded_batch_no` 列
+  永久保存**记录时的批次号**；快照的版本/结论/原因等内容一律不改。所有这些视图的逐批条目
+  同时返回 `recorded_batch_no`（历史号）与 `current_batch_no`（现行号）。
+- **旧号可处理原交接的退回/复核**：`POST /api/handovers/{no}/returns` 的批次清单与
+  `POST /api/handovers/{no}/reviews/{batch_no}/decision` 路径参数可提交**记录时历史号或
+  现行号**定位同一批；按旧号查询 `GET /api/batches/{old}/handover` 返回历次交接（逐条标注
+  `recorded_batch_no`）与当前去向。原交接详情、退回列表/详情同样逐批并列历史号与现行号。
+- **拒绝与原子性**：
+
+| 场景 | HTTP | error.code |
+| --- | --- | --- |
+| 现行批次不存在（未知号） | 404 | `BATCH_NOT_FOUND` |
+| 更正已作废批次的批次号 | 409 | `BATCH_VOIDED` |
+| 提交的是历次历史别名（只可查询） | 409 | `BATCH_NO_HISTORICAL_ALIAS`（`details.current_batch_no`） |
+| 新号为空/纯空白、原因为空/纯空白 | 400 | `INVALID_PAYLOAD` |
+| 新号与现行号相同 | 409 | `SAME_SOURCE_TARGET_BATCH_NO` |
+| 新号已被现行号占用 | 409 | `BATCH_NO_ALREADY_TAKEN`（`details.occupied_as=CURRENT`） |
+| 新号已被任一批次的历史别名占用（含本批旧号） | 409 | `BATCH_NO_ALREADY_TAKEN`（`occupied_as=HISTORICAL_ALIAS`） |
+| 缺 `new_batch_no` / `reason` 字段 | 422 | FastAPI 模型校验 |
+
+  全部校验在同一 `BEGIN IMMEDIATE` 事务（延迟外键到提交时统一校验）内完成，任一失败整体
+  回滚——**不写更正记录、不留别名、不改任何当前关联或历史快照**。
+
+更正成功响应（200）：
+
+```jsonc
+{
+  "renamed": { /* 更正后的完整批次记录：batch_no/current_batch_no=B101，
+                  line_id/seq、用料/声明/清洁、adjudication、shipment_eligibility 均不变，
+                  previous_batch_nos=["B1"] */ },
+  "rename": { "rename_id": 1, "previous_batch_no": "B1", "new_batch_no": "B101",
+              "reason": "现场发现批次号录错，更正标识", "renamed_at": "2026-10-03T..." },
+  "identity": { "current_batch_no": "B101",
+                "previous_batch_nos": ["B1"], "alias_batch_nos": ["B1"] },
+  "changed": true
+}
+```
+
+历史快照逐批条目（核验确认 / 交接 / 退回 / 复核）统一形状：
+
+```jsonc
+{
+  "position": 1,
+  "batch_no": "B101",              // 现行号（随编号更正更新）
+  "current_batch_no": "B101",
+  "recorded_batch_no": "B1",      // 记录时的批次号（永久冻结，不改写）
+  "adjudication": { /* …记录时冻结内容，不变… */ }
+}
+```
+
 ### 原料批号并档（误登记双编号合并）
 
 同一原料批号被误登记成两个编号时，可凭**源批号、目标批号和非空原因**并档
@@ -311,6 +395,11 @@
 | 更正/锁定已并档停用批号 | 409 | `MATERIAL_LOT_MERGED` |
 | 批次作废原因为空或纯空白 | 400 | `INVALID_PAYLOAD` |
 | 作废不存在的批次 | 404 | `BATCH_NOT_FOUND` |
+| 更正批次号时提交的是历次历史别名（只可查询） | 409 | `BATCH_NO_HISTORICAL_ALIAS` |
+| 新核验清单/修订清单使用历史批次号 | 400 | `BATCH_NO_HISTORICAL_ALIAS` |
+| 编号更正新号与现行号相同 | 409 | `SAME_SOURCE_TARGET_BATCH_NO` |
+| 编号更正新号已被现行号或历史别名占用 | 409 | `BATCH_NO_ALREADY_TAKEN`（`details.occupied_as`） |
+| 编号更正新号/原因为空或纯空白 | 400 | `INVALID_PAYLOAD` |
 | 更正/清洁更正已作废批次 | 409 | `BATCH_VOIDED` |
 | 新核验单含已作废批次 | 400 | `BATCH_VOIDED` |
 | 含作废批次的单据重新核验/确认 | 409 | `VERIFICATION_CONTAINS_VOIDED_BATCH` |
@@ -426,7 +515,7 @@ python -m app
 
 ```bash
 pip install pytest httpx
-python -m pytest -q            # 213 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、清洁更正预演（只读）、出货前批次清单修订（乐观修订号/同事务快照/并发一致性）、装车交接、已装车交接批次退货（部分退回/占用释放/新单核验再发运/历次去向/原子拒绝/并发一致/旧库升级）、已发运批次发运后质量复核（逐批快照对比/只追加处置/同状态不重复/过期所见拒绝/旧库升级）、原料批号并档（改指去重/按线重算/资格按目标锁定状态/源号停用/原子拒绝/旧库升级）、旧库升级
+python -m pytest -q            # 236 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、已投产批次号更正（标识更正/历史别名/当前关联随现行号/历史快照保留记录时号/旧号可查不可写/原交接退回复核旧号定位/原子拒绝/旧库升级）、清洁更正预演（只读）、出货前批次清单修订（乐观修订号/同事务快照/并发一致性）、装车交接、已装车交接批次退货（部分退回/占用释放/新单核验再发运/历次去向/原子拒绝/并发一致/旧库升级）、已发运批次发运后质量复核（逐批快照对比/只追加处置/同状态不重复/过期所见拒绝/旧库升级）、原料批号并档（改指去重/按线重算/资格按目标锁定状态/源号停用/原子拒绝/旧库升级）、旧库升级
 
 # 服务启动后，运行端到端调用示例（标准库 urllib，无需额外依赖）
 python examples/run_demo.py
@@ -451,6 +540,13 @@ BASE_URL=http://127.0.0.1:8080 python examples/batch_void_demo.py
 # 误归产线更正（换线）端到端示例（两线重算/原线留空/历史产线序号不改/资格版本不递增/核验单联动）
 python examples/batch_reassign_demo.py
 BASE_URL=http://127.0.0.1:8080 python examples/batch_reassign_demo.py
+
+# 已投产批次号更正（标识更正）端到端示例（连续更正/历次旧号永久保留为查询别名、
+#   不得再登记；只改标识：裁决/资格版本、单据修订号与状态不变、发运占用不释放；
+#   确认/交接/退回/复核历史快照保留记录时号并同时回传历史号与现行号；
+#   按旧号查询、登记原交接退回与复核处置仍可定位；新核验清单只接受现行号）
+python examples/batch_rename_demo.py
+BASE_URL=http://127.0.0.1:8080 python examples/batch_rename_demo.py
 
 # 原料批号并档端到端示例（误登记双编号合并：有效批次改指去重/两线按序重算 MERGE_LOT/
 #   出货资格按目标号锁定状态更新/已确认核验单转待复核/源号留档停用/已发运批次仍按原交接追溯）
@@ -560,7 +656,9 @@ BASE_URL=http://127.0.0.1:8080 python examples/shipment_review_demo.py
 | POST | `/api/batches/{batch_no}/cleaning/preview` | **只读预演**：正式清洁更正前推演同线该批及后续有效批次残留/实际/未声明/RELEASE/HOLD，及将转待复核的已确认核验单（不改任何数据） |
 | POST | `/api/batches/{batch_no}/void` | **作废误登记批次**，请求体 `{"reason": "..."}`（必填非空）；保留可查、号不可复用，其后有效批次按序重算，已确认核验单转待复核；重复作废幂等 |
 | POST | `/api/batches/{batch_no}/reassign` | **更正误归产线（换线）**，请求体 `{"target_line_id": "L2"}`（须为另一条已登记产线）；批次移至目标线末尾获新顺序号，原线序号留空，两线按序重算追加 `MOVE_BATCH` 版本，已确认核验单转待复核；直接用料不变、出货资格版本不递增 |
-| GET | `/api/batches/{batch_no}/history` | 查询该批**历史裁决版本**（只追加，含触发原因与时间；逐版记录当时产线与顺序号），作废批次标明状态 |
+| POST | `/api/batches/{batch_no}/rename` | **已投产批次号更正（只改标识）**，请求体 `{"new_batch_no","reason"}`（新号须未被现行号/历史别名占用，原因非空）；可连续更正，历次旧号永久保留为查询别名、不得再登记；裁决/资格版本、单据修订号与状态不变、发运占用不释放；历史快照保留记录时号 |
+| GET | `/api/batch-renames` | 列出**只追加**的批次号更正记录；`?batch_no=` 可凭现行号或历次历史别名过滤同一批 |
+| GET | `/api/batches/{batch_no}/history` | 查询该批**历史裁决版本**（只追加，含触发原因与时间；逐版记录当时产线与顺序号；可凭现行号或历史别名查询），作废批次标明状态 |
 
 ### 批次作废
 
@@ -634,6 +732,24 @@ BASE_URL=http://127.0.0.1:8080 python examples/shipment_review_demo.py
 （历史接口逐版返回 `line_id` / `seq`）；直接用料未变，**出货资格版本不递增**、
 资格历史不追加；已确认核验单转待复核，历次确认快照保持原样；未知批次/目标线、已作废批次、
 目标线与原线相同整体拒绝，失败不留下部分归属或裁决版本。
+
+### 批次号更正（标识更正）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/batches/{batch_no}/rename` | **已投产批次号更正**：请求体 `{"new_batch_no","reason"}`；只改标识，可连续更正，历次旧号永久保留为查询别名、不得再登记；裁决/资格版本、单据修订号与状态不变、发运占用不释放（200） |
+| GET | `/api/batch-renames` | 列出全部只追加的批次号更正记录；`?batch_no=` 可凭**现行号或历次历史别名**过滤同一批（未知号 404） |
+
+批次详情、历史裁决、出货资格、核验单逐批记录均回显标识字段：
+`current_batch_no`（现行号）与 `previous_batch_nos` / `alias_batch_nos`（历次旧号，
+按更正先后）。按**历史号** `GET` 批次/历史/资格/交接归属可定位同一批（附加
+`queried_batch_no`），但写入口（更正内容/清洁/作废/换线）只接受现行号，历史号返回
+409 `BATCH_NO_HISTORICAL_ALIAS`；新核验/修订清单使用历史号返回 400 同名错误码。
+
+已确认核验、交接、退回、发运后复核的逐批历史快照条目统一附加
+`recorded_batch_no`（记录时批次号，永久不改写）与 `current_batch_no`（现行号）；
+原交接的退回（`POST .../returns` 批次清单）与发运后复核处置
+（`POST .../reviews/{batch_no}/decision`）路径参数可提交**记录时历史号或现行号**。
 
 ### 出货资格
 
@@ -855,6 +971,7 @@ DRAFT ──confirm 成功──▶ CONFIRMED
 | 所见修订号过期（与当前修订号不一致） | 409 | `VERIFICATION_REVISION_CONFLICT`（`details` 含 `submitted_revision` / `current_revision`） |
 | 新清单含未登记批次 | 400 | `UNKNOWN_BATCH` |
 | 新清单内批次号重复 | 400 | `DUPLICATE_BATCH_IN_VERIFICATION` |
+| 新清单使用历次历史批次号（只接受现行号） | 400 | `BATCH_NO_HISTORICAL_ALIAS`（`details` 含 `current_batch_no`） |
 | 新清单含已作废批次 | 400 | `BATCH_VOIDED` |
 | 清单元素为空/非字符串 | 400 | `INVALID_PAYLOAD` |
 | `batch_nos` 为空 / 缺字段 / `expected_revision` 缺失或 < 1 | 422 | FastAPI 模型校验 |
@@ -1348,6 +1465,25 @@ curl -s -X POST http://127.0.0.1:8080/api/material-lots/RM-NUT-000/lock \
 
 # 36) 并档记录只追加可查
 curl -s http://127.0.0.1:8080/api/material-lot-merges
+
+# 37) 已投产批次号录错：凭现行号 + 未占用新号 + 非空原因更正标识
+#     （可连续更正；历次旧号永久保留为查询别名、不得再登记；裁决/资格版本、单据
+#      修订号与状态不变、发运占用不释放；历史快照保留记录时批次号）
+curl -s -X POST http://127.0.0.1:8080/api/batches/B001/rename \
+  -H 'Content-Type: application/json' \
+  -d '{"new_batch_no":"B20261001","reason":"现场发现投产批次号录错，更正为正确编号"}'
+
+# 38) 旧号仍可查询定位同一批（同时回传历史号与现行号），但不得再登记/更正/作废，
+#     新核验清单只接受现行号；更正记录只追加可查（可按任一历史号过滤同一批）
+curl -s http://127.0.0.1:8080/api/batches/B001                    # -> current_batch_no=B20261001
+curl -s http://127.0.0.1:8080/api/batches/B001/history
+curl -s http://127.0.0.1:8080/api/batches/B001/handover           # 旧号可追溯原交接/退回
+curl -s http://127.0.0.1:8080/api/batch-renames
+curl -s 'http://127.0.0.1:8080/api/batch-renames?batch_no=B001'
+# 凭旧号处理原交接的退回、发运后复核仍可定位：
+curl -s -X POST http://127.0.0.1:8080/api/handovers/HO-001/returns \
+  -H 'Content-Type: application/json' \
+  -d '{"return_no":"RT-OLD-1","batch_nos":["B001"],"reason":"按记录时批次号登记原交接退货"}'
 ```
 
 更多可运行示例见 [`examples/run_demo.py`](examples/run_demo.py)（包含完整的
@@ -1363,6 +1499,11 @@ curl -s http://127.0.0.1:8080/api/material-lot-merges
 （拒绝场景 → 换线新旧归属/原线留空 → 两线重算与历史版本产线序号不改 →
 出货资格版本不递增 → 已确认单据转待复核且确认快照原样 → 顺序号不复用 →
 重新核验后二次确认与历史快照保留）；
+已投产批次号更正（标识更正）全流程示例见 [`examples/batch_rename_demo.py`](examples/batch_rename_demo.py)
+（拒绝场景整体回滚 → 更正后只改标识：产线/顺序号/版本/修订号/占用不变 →
+历次旧号可查不可写、新核验清单只认现行号 → 确认/交接快照保留记录时号 →
+凭旧号登记原交接退回与发运后复核处置 → 连续更正旧号链均可追溯 →
+只追加更正记录按现行号/历史号过滤）；
 原料批号并档全流程示例见 [`examples/lot_merge_demo.py`](examples/lot_merge_demo.py)
 （误登记双编号合并：拒绝场景整体回滚 → 有效批次改指目标号并去重 →
 两线自最早引用批次按序重算 MERGE_LOT → 出货资格按目标号锁定状态更新 →
@@ -1404,7 +1545,7 @@ curl -s http://127.0.0.1:8080/api/material-lot-merges
 │   ├── allergens.py     # 14 项过敏原受控字典
 │   ├── errors.py        # 业务错误（code + HTTP 状态码）
 │   ├── db.py            # SQLite 连接、建表、事务、初始化/种子
-│   ├── service.py       # 核心规则：传递/清洁/裁决、更正重算、历史版本、出货核验单、装车交接、交接批次退货、发运后复核、原料批号并档
+│   ├── service.py       # 核心规则：传递/清洁/裁决、更正重算、历史版本、出货核验单、装车交接、交接批次退货、发运后复核、原料批号并档、批次号更正（标识更正/历史别名）
 │   ├── schemas.py       # 请求模型
 │   ├── main.py          # FastAPI 路由
 │   └── __main__.py      # python -m app 入口
@@ -1413,6 +1554,7 @@ curl -s http://127.0.0.1:8080/api/material-lot-merges
 ├── examples/lot_lock_demo.py     # 原料批号待检锁定/出货资格端到端调用示例
 ├── examples/batch_void_demo.py   # 误登记批次作废端到端调用示例
 ├── examples/batch_reassign_demo.py # 误归产线更正（换线）端到端调用示例
+├── examples/batch_rename_demo.py   # 已投产批次号更正（标识更正：历史别名/快照保留记录时号/旧号退回复核）端到端调用示例
 ├── examples/lot_merge_demo.py      # 原料批号并档（误登记双编号合并）端到端调用示例
 ├── examples/shipment_handover_demo.py # 装车交接（整单发运/冻结快照/占用追溯）端到端调用示例
 ├── examples/shipment_return_demo.py # 已装车交接批次退货（部分退回/占用释放/新单核验再发运/冻结引用）端到端调用示例
@@ -1425,6 +1567,7 @@ curl -s http://127.0.0.1:8080/api/material-lot-merges
 ├── tests/test_lot_lock.py        # pytest 测试（批号锁定/出货资格/旧库升级，18 项）
 ├── tests/test_batch_void.py      # pytest 测试（批次作废/重算联动/核验单拒绝/旧库升级，23 项）
 ├── tests/test_batch_reassign.py  # pytest 测试（误归产线换线/两线重算/历史归属/资格不递增/核验单联动/原子性，26 项）
+├── tests/test_batch_rename.py    # pytest 测试（批次号更正：连续更正/历史别名可查不可写/当前关联随现行号/版本修订号占用不变/历史快照记录时号/旧号退回复核/原子拒绝/旧库升级，23 项）
 ├── tests/test_lot_merge.py       # pytest 测试（原料批号并档：改指去重/按线重算/资格按目标锁定状态/核验单联动/源号停用/原子拒绝/旧库升级，15 项）
 ├── tests/test_cleaning_preview.py # pytest 测试（清洁更正预演：逐批推演/版本影响范围/跳过作废批/锁定不参与/只读性/与正式更正一致/拒绝，20 项）
 ├── tests/test_shipment_handover.py # pytest 测试（装车交接：冻结快照/状态版本门禁/占用唯一/并发原子性/不可变追溯/旧库升级，20 项）
@@ -1444,7 +1587,13 @@ curl -s http://127.0.0.1:8080/api/material-lot-merges
 - `material_lot_merge`：原料批号并档记录（源批号 → 目标批号、非空原因、并档时间）；
   只追加、不可变
 - `line` / `batch` / `batch_material`：产线、批次（含 `line_id+seq` 唯一顺序、
-  `status`/`voided_reason`/`voided_at` 作废标记）、批次用料关联
+  `status`/`voided_reason`/`voided_at` 作废标记）、批次用料关联；
+  **批次号更正只改 `batch.batch_no` 主键及各当前关联表的外键值，不改批次内容**
+- `batch_no_rename`：已投产批次号更正记录（只追加、不可变：原现行号 → 新号、非空原因、
+  更正时间）；同一批可连续更正
+- `batch_no_alias`：批次号查询别名——每个号（现行号自身 `is_current=1` 与历次历史号
+  `is_current=0`）一行指向同一批现行号；登记新批次据此统一查重，所有按号入口据此把
+  历史号解析到现行号；历史别名永久保留、不得再登记
 - `adjudication`：每批当前裁决快照（作废后冻结保留，不再更新）
 - `adjudication_version`：只追加的历史裁决版本（`REGISTER` / `CORRECT_BATCH` / `CORRECT_LOT` /
   `VOID_BATCH` / `MOVE_BATCH` / `MERGE_LOT`；每版记录裁决当时的 `line_id` / `seq`，换线不改写历史版本）
@@ -1455,24 +1604,30 @@ curl -s http://127.0.0.1:8080/api/material-lot-merges
 - `verification`：出货核验单（`DRAFT` / `PENDING_REVIEW` / `CONFIRMED`；
   `revision` 单据修订号，创建为 1，重新核验/批次清单修订/确认等单据快照写入时递增，
   用于修订的乐观并发校验）
-- `verification_batch`：核验单逐批快照（创建/重新核验/批次清单修订时的裁决版本/结论
-  与出货资格版本/状态，按提交顺序保序；修订时整体重写）
-- `verification_confirmation` / `verification_confirmation_batch`：只追加的历次确认及其逐批快照副本
+- `verification_batch`：核验单【当前】逐批成员与快照（创建/重新核验/批次清单修订时的
+  裁决版本/结论与出货资格版本/状态，按提交顺序保序；修订时整体重写）；
+  **`batch_no` 随批次号更正更新为现行号，单据修订号与状态不变**
+- `verification_confirmation` / `verification_confirmation_batch`：只追加的历次确认及其
+  逐批快照副本；`batch_no` 随编号更正更新，`recorded_batch_no` 保留确认记录时批次号
 - `shipment_handover`：装车交接主记录（唯一交接号 → 核验单号、交接时冻结的单据修订号、
   最近一次确认引用、确认/交接时间、批次数）；只追加、不可变
 - `shipment_handover_batch`：交接时逐批冻结的**最近一次确认快照**不可变副本
-  （裁决版本/结论 + 出货资格版本/状态，按确认清单顺序保序）
+  （裁决版本/结论 + 出货资格版本/状态，按确认清单顺序保序）；`batch_no` 随编号更正更新、
+  `recorded_batch_no` 永久保留交接记录时批次号，快照内容不改写
 - `shipment_handover_occupancy`：每批全局唯一的已发运占用（`batch_no` 主键），
-  数据库层兜底“任一批次已在其他交接记录发运即整单拒绝、不得重复发运”
+  数据库层兜底“任一批次已在其他交接记录发运即整单拒绝、不得重复发运”；
+  **批次号更正时占用随现行号更新、不释放**
 - `shipment_review`：已发运批次发运后复核处置的**只追加**历史（交接号+批次+
   处置时所见的当前裁决版本/出货资格版本/作废状态 + `RECALL_REQUIRED`/`NO_RECALL`
-  处置结论与非空原因 + 处置时间）；唯一索引
+  处置结论与非空原因 + 处置时间）；`batch_no` 随编号更正更新、`recorded_batch_no`
+  保留首次处置记录时号；唯一索引
   `(handover_no, batch_no, seen_adjudication_version, seen_shipment_version, seen_batch_voided)`
   在数据库层保证“同一所见状态不得重复处置”；交接冻结快照与核验/交接原流程不被本表改写
 - `shipment_return`：已装车交接批次退货主记录（唯一退回号 → 原交接号、非空原因、
   本笔退回批次数、退回时间）；只追加、不可变
 - `shipment_return_batch`：退回逐批成员，仅冻结“原交接 + 原交接顺序号 + 批次”的引用
   关系（逐批快照始终引用 `shipment_handover_batch` 的不可变副本，不复制内容）；
+  `batch_no` 随编号更正更新、`recorded_batch_no` 保留退回记录时号；
   主键 `(return_no, batch_no)`，并以 `UNIQUE(handover_no, batch_no)` 在数据库层保证
   “同一交接的同一批次至多退回一次”；登记成功时同事务删除对应
   `shipment_handover_occupancy` 占用行（未退回批次的占用保留），退回批次可被新核验单/
@@ -1488,11 +1643,20 @@ curl -s http://127.0.0.1:8080/api/material-lot-merges
 交接批次退货在同一事务内完成“退回号唯一/原交接存在/逐批归属与未退回校验”与
 退回主记录、逐批引用写入及本批占用删除，重复退回号、非本交接或已退回批次、
 空原因或空/重复清单均整体回滚，不写入退回记录、不留下部分释放；
+批次号更正在同一事务（延迟外键到提交时统一校验）内完成“现行号/目标号占用/作废状态
+校验”与更正记录写入、全部当前关联表改键、历史快照表记录时号落列及别名表切换，
+未知/已作废批次、空原因、目标号相同或已被现行号/历史别名占用均整体回滚，
+不写更正记录、不留别名、不留下部分更名或引用；
 新表以 `CREATE TABLE IF NOT EXISTS` 幂等加入（含三张装车交接表、两张交接退货表、发运后复核处置表
-`shipment_review` 及其唯一索引，以及原料批号并档记录表 `material_lot_merge`），
-既有快照表新增列、`verification.revision` 修订号列与 `material_lot` 的
-`status`/`merged_into`/`merged_reason`/`merged_at` 并档列通过 `ALTER TABLE`（逐列检查）
-幂等补齐（既有单据修订号按 1 计、既有批号视为 `ACTIVE` 可使用），旧数据库启动时自动升级，
+`shipment_review` 及其唯一索引，原料批号并档记录表 `material_lot_merge`，以及批次号
+更正记录表 `batch_no_rename` 与查询别名表 `batch_no_alias`），
+既有快照表新增列、`verification.revision` 修订号列、`material_lot` 的
+`status`/`merged_into`/`merged_reason`/`merged_at` 并档列，以及
+`verification_confirmation_batch` / `shipment_handover_batch` /
+`shipment_return_batch` / `shipment_review` 的 `recorded_batch_no` 记录时批次号列
+通过 `ALTER TABLE`（逐列检查）
+幂等补齐（既有单据修订号按 1 计、既有批号视为 `ACTIVE` 可使用、既有快照的记录时号
+回填为当时批次号、既有批次补“现行号→自身”查询别名），旧数据库启动时自动升级，
 并为既有批次补出货资格 v1（`UPGRADE_INIT`，不改变既有核验单状态；升级前的旧确认快照
 出货资格字段为空，确认时要求先重新核验）；批次表的 `status`/`voided_reason`/`voided_at`
 作废列同样幂等补齐（既有批次为 `ACTIVE`），作废相关索引在列迁移后建立；

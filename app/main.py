@@ -11,6 +11,7 @@ from .schemas import (
     BatchCorrection,
     BatchIn,
     BatchReassignIn,
+    BatchRenameIn,
     BatchVoidIn,
     CleaningCorrection,
     HandoverIn,
@@ -35,7 +36,7 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
             "原料批号并档（误登记双编号合并）、出货核验、整单装车交接与已交接批次退货"
             "（部分退回、新单核验后再发运）、发运后质量复核。"
         ),
-        version="1.2.0",
+        version="1.3.0",
     )
 
     store = Store(db_path or config.DB_PATH)
@@ -208,6 +209,28 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def batch_history(batch_no: str, service: Service = Depends(svc)):
         """查询某批次历次裁决版本（可审计的历史裁决）。"""
         return service.batch_history(batch_no)
+
+    # ---------------- 批次号更正（标识更正） ----------------
+
+    @app.post("/api/batches/{batch_no}/rename", tags=["批次号更正"], status_code=200)
+    def rename_batch(batch_no: str, body: BatchRenameIn, service: Service = Depends(svc)):
+        """已投产批次号录错时的编号更正：凭现行批次号、未占用的新号与非空原因更正标识。
+
+        同一批可连续更正；历次旧号永久保留为查询别名、不得再登记，也不得凭历史号
+        更正/作废（写入口只接受现行号，按旧号可查询并定位同一批）。当前批次、裁决、
+        出货资格、核验单当前成员及发运占用均改以现行号关联同一批；编号更正本身不改
+        裁决/资格版本、单据修订号与状态，也不释放发运占用。已确认核验、交接、退回、
+        发运后复核的历史快照保留记录时的批次号与内容，逐批同时回传历史号(recorded_batch_no)
+        与现行号(current_batch_no)；新核验清单只接受现行号。
+        未知/已作废批次、空原因、目标号为空/相同/已被现行号或历史别名占用均整体拒绝，
+        失败不留下部分更名或引用。
+        """
+        return service.rename_batch(batch_no, body.new_batch_no, body.reason)
+
+    @app.get("/api/batch-renames", tags=["批次号更正"])
+    def list_batch_renames(batch_no: str | None = None, service: Service = Depends(svc)):
+        """列出批次号更正记录（只追加）；?batch_no= 可凭现行号或历次历史别名过滤同一批。"""
+        return service.list_batch_renames(batch_no)
 
     # ---------------- 出货资格（原料批号待检锁定） ----------------
 

@@ -386,7 +386,7 @@ def test_list_and_get_returns(client):
     # 按原交接过滤
     body = client.get("/api/handovers/H1/returns").json()
     assert [r["return_no"] for r in body["returns"]] == ["R1", "R2"]
-    assert body["returns"][0]["batches"] == [{"position": 1, "batch_no": "B1"}]
+    assert body["returns"][0]["batches"] == [{"position": 1, "batch_no": "B1", "recorded_batch_no": "B1", "current_batch_no": "B1"}]
 
     # 全量列表
     body = client.get("/api/returns").json()
@@ -414,7 +414,7 @@ def test_handover_list_summary_carries_returns(client):
     assert h["returned_batch_count"] == 1
     assert h["outstanding_batch_count"] == 1
     assert h["returns"][0]["return_no"] == "R1"
-    assert h["returns"][0]["batches"] == [{"position": 1, "batch_no": "B1"}]
+    assert h["returns"][0]["batches"] == [{"position": 1, "batch_no": "B1", "recorded_batch_no": "B1", "current_batch_no": "B1"}]
 
 
 # ---------------------------------------------------------------- 拒绝路径

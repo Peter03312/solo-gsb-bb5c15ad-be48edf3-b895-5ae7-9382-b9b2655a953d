@@ -585,7 +585,7 @@ def test_list_and_filter_and_trace_queries(client):
     # 列表按交接时间排序，摘要含成员顺序/批号，不含快照详情
     body = client.get("/api/handovers").json()["handovers"]
     assert [h["handover_no"] for h in body] == ["H1", "H2"]
-    assert body[0]["batches"] == [{"position": 1, "batch_no": "B1"}]
+    assert body[0]["batches"] == [{"position": 1, "batch_no": "B1", "recorded_batch_no": "B1", "current_batch_no": "B1"}]
     assert body[0]["batch_count"] == 1
 
     # 按核验单过滤

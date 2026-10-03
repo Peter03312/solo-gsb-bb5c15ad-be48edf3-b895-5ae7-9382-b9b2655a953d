@@ -59,6 +59,20 @@ class BatchReassignIn(BaseModel):
     )
 
 
+class BatchRenameIn(BaseModel):
+    new_batch_no: str = Field(
+        ...,
+        description=(
+            "更正后的新批次号（必填）：必须未被占用——不得是任一批次的现行号，"
+            "也不得是任何批次的历史别名（历次旧号永久保留、不得再登记）"
+        ),
+    )
+    reason: str = Field(
+        ...,
+        description="批次号更正原因（必填，不允许空白）；编号更正只改标识，不改批次内容/裁决/资格版本、单据修订号与状态，也不释放发运占用",
+    )
+
+
 class VerificationIn(BaseModel):
     verification_no: str = Field(..., description="出货核验单号（唯一）")
     batch_nos: list[str] = Field(..., min_length=1, description="关联的已登记生产批次号列表；非空、不可重复，按提交顺序保存")
